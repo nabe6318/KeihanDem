@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>畦畔検出マップ</title>
+<title>畦畔・田面マップ</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.11.0/proj4.js"></script>
@@ -51,7 +51,7 @@
 <body>
 <div id="app">
   <header>
-    <h1>畦畔検出マップ</h1>
+    <h1>畦畔・田面マップ</h1>
     <span id="status">DEM(GeoTIFF)と筆ポリゴンを読み込んでください</span>
   </header>
   <div id="main">
@@ -77,6 +77,19 @@ const CONFIG = {
     edgeDist: 5,       // 筆の境界からこの距離(m)より内側の畦畔は田面に戻す(0=制限なし)。法面が広い棚田では広めに
     smooth: 1,         // 畦畔の輪郭をならす回数(3×3の多数決)。小さな突起・ギザギザを除く(0=しない)
     csOpacity: 0.85, clsOpacity: 0.75,
+    mode: 'aze',       // 'aze'=畦畔検出(筆ポリゴンを使う)、'trace'=田面トレース(DEMだけ)
+    // --- 田面トレース ---
+    tSlope: 4,         // この傾斜(度)未満を平坦とする
+    tRelief: 10,       // 細い高まりがこの高さ(cm)以上は畦(田面の切れ目)
+    tCore: 2,          // 田面の芯:畦から この距離(m)以上離れた所を種にする。これより細いすき間(水口・細い農道)で田面を切り離す
+    tDz: 15,           // 芯の平均標高から この差(cm)以内の平坦部まで広げる
+    tMinArea: 100,     // これより小さい田面(m²)は除く
+    tMaxSd: 10,        // 標高のばらつき(標準偏差, cm)がこれより大きい面は除く(水平でない=畑・斜面)
+    tSimp: 0.7,        // 輪郭の単純化(m、ダグラス・ポイカー)
+    tEdgeEx: true,     // 計算範囲の端にかかる田面は除く(途中で切れているため)
+    tHole: 30,         // 田面の中の、これより小さい穴(m²)は埋める
+    tShift: 5,         // 筆ポリゴンとのずれを探す範囲(m)
+    showTrace: true,
     showCs: true, showCls: true, showFude: true,
   },
   maxCells: 25e6,      // 一度に計算するセル数の上限(1mなら 25 km²)。超えたら地図を拡大して範囲を絞る
@@ -280,8 +293,9 @@ async function addFudeFiles(files) {
   saveP();
   fudeLayer.clearLayers(); fudeLayer.addData({ type: 'FeatureCollection', features: FUDE });
   if (P.showFude) fudeLayer.addTo(map);
-  if (FUDE.length) map.fitBounds(fudeLayer.getBounds());
+  if (FUDE.length && !TR) map.fitBounds(fudeLayer.getBounds());
   setStatus(`筆ポリゴン ${nf(FUDE.length)} 筆`);
+  if (TR) await retrace('match');
   render();
 }
 const fudeId = (f, i) => P.idField ? f.properties[P.idField] : i + 1;
@@ -319,9 +333,8 @@ const CS_ELEV = [[120, 170, 210], [120, 190, 110], [235, 225, 140], [200, 140, 8
 const CS_CURV = [[40, 80, 210], [255, 255, 255], [215, 70, 30]];
 const CS_SLOPE = [[255, 255, 255], [185, 135, 100], [70, 35, 20]];
 
-// 表示範囲(地図)× DEM × 筆ポリゴン の重なりを計算範囲にする
-function planArea() {
-  if (!TILES.length || !FUDE.length) throw new Error('DEMと筆ポリゴンを読み込んでください');
+// 地図の表示範囲 × DEMの範囲(平面直角座標の [x0, y0, x1, y1])
+function viewExtent() {
   const b = map.getBounds(), tr = DEMI.tr;
   const vb = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
   const pts = []; for (let i = 0; i <= 8; i++) { const f = i / 8;
@@ -332,9 +345,11 @@ function planArea() {
   const ty0 = Math.min(...TILES.map(t => t.oy - t.H * t.dy)), ty1 = Math.max(...TILES.map(t => t.oy));
   x0 = Math.max(x0, tx0); x1 = Math.min(x1, tx1); y0 = Math.max(y0, ty0); y1 = Math.min(y1, ty1);
   if (x0 >= x1 || y0 >= y1) throw new Error('表示範囲にDEMがありません。DEMのある所(黄色の点線)に地図を移動してください');
-  // 範囲内の筆(条件に合うもの)を平面直角座標へ
-  const pad = P.buffer + 2;
-  const sel = [];
+  return [x0, y0, x1, y1];
+}
+// 範囲にかかる筆(「対象の筆」の条件に合うもの)を平面直角座標へ
+function selectFude(x0, y0, x1, y1) {
+  const tr = DEMI.tr, sel = [];
   FUDE.forEach((f, i) => {
     if (!fudeSelected(f)) return;
     const polys = f.geometry.type === 'Polygon' ? [f.geometry.coordinates] : f.geometry.coordinates;
@@ -346,19 +361,35 @@ function planArea() {
     xy.forEach(poly => poly.forEach((ring, k) => { let s = 0; for (let j = 0, l = ring.length - 1; j < ring.length; l = j++) s += (ring[l][0] + ring[j][0]) * (ring[l][1] - ring[j][1]); s = Math.abs(s) / 2; area += k ? -s : s; }));
     sel.push({ f, i, xy, bbox: [fx0, fy0, fx1, fy1], area });
   });
-  if (!sel.length) throw new Error(P.filterField && P.filterValue !== '' ? `表示範囲に、${P.filterField} = ${P.filterValue} の筆ポリゴンがありません。「対象の筆」の条件を確かめてください` : '表示範囲に筆ポリゴンがありません');
-  x0 = Math.max(x0, Math.min(...sel.map(s => s.bbox[0])) - pad); x1 = Math.min(x1, Math.max(...sel.map(s => s.bbox[2])) + pad);
-  y0 = Math.max(y0, Math.min(...sel.map(s => s.bbox[1])) - pad); y1 = Math.min(y1, Math.max(...sel.map(s => s.bbox[3])) + pad);
-  // 最初のタイルの画素の並びにそろえる
+  return sel;
+}
+// 範囲を、最初のDEMタイルの画素の並びにそろえたグリッドにする
+function gridFor(x0, y0, x1, y1) {
   const T0 = TILES[0], dx = DEMI.dx, dy = DEMI.dy;
   const c0 = Math.floor((x0 - T0.ox) / dx), c1 = Math.ceil((x1 - T0.ox) / dx), r0 = Math.floor((T0.oy - y1) / dy), r1 = Math.ceil((T0.oy - y0) / dy);
   const w = c1 - c0, h = r1 - r0;
   if (w * h > CONFIG.maxCells) throw new Error(`範囲が広すぎます(${nf(w * h / 1e6, 1)} 百万セル、上限 ${nf(CONFIG.maxCells / 1e6)} 百万)。地図を拡大して範囲を絞ってください`);
-  return { ox: T0.ox + c0 * dx, oy: T0.oy - r0 * dy, dx, dy, w, h, N: w * h, sel };
+  return { ox: T0.ox + c0 * dx, oy: T0.oy - r0 * dy, dx, dy, w, h, N: w * h };
+}
+// 畦畔検出:表示範囲 × DEM × 筆ポリゴン の重なりを計算範囲にする
+function planArea() {
+  if (!TILES.length || !FUDE.length) throw new Error('DEMと筆ポリゴンを読み込んでください');
+  let [x0, y0, x1, y1] = viewExtent();
+  const sel = selectFude(x0, y0, x1, y1);
+  if (!sel.length) throw new Error(P.filterField && P.filterValue !== '' ? `表示範囲に、${P.filterField} = ${P.filterValue} の筆ポリゴンがありません。「対象の筆」の条件を確かめてください` : '表示範囲に筆ポリゴンがありません');
+  const pad = P.buffer + 2;
+  x0 = Math.max(x0, Math.min(...sel.map(s => s.bbox[0])) - pad); x1 = Math.min(x1, Math.max(...sel.map(s => s.bbox[2])) + pad);
+  y0 = Math.max(y0, Math.min(...sel.map(s => s.bbox[1])) - pad); y1 = Math.min(y1, Math.max(...sel.map(s => s.bbox[3])) + pad);
+  return { ...gridFor(x0, y0, x1, y1), sel };
+}
+// 田面トレース:表示範囲 × DEM(筆ポリゴンは使わない)
+function planDem() {
+  if (!TILES.length) throw new Error('DEMを読み込んでください');
+  return gridFor(...viewExtent());
 }
 
 // 筆ポリゴンをグリッドに焼き込み(セル → 筆の番号)、バッファ分だけ広げて農地ブロック(ディゾルブ)にする
-function rasterFude() {
+function rasterFude(buffer = P.buffer, close = P.close) {
   const { w, h, N, sel } = A;
   const fid = new Int32Array(N).fill(-1);
   sel.forEach((s, k) => {
@@ -375,7 +406,7 @@ function rasterFude() {
     }
   });
   // バッファ:1セルずつ広げる(4近傍と8近傍を交互=八角形)。広げたセルは隣の筆に属させる
-  const steps = P.buffer > 0 ? Math.max(1, Math.round(P.buffer / A.dx)) : 0;
+  const steps = buffer > 0 ? Math.max(1, Math.round(buffer / A.dx)) : 0;
   const dilate = (src, n, val) => {   // val:広げる対象の判定、戻り値:新しく加わったセル
     let cur = src;
     for (let s = 0; s < n; s++) {
@@ -394,7 +425,7 @@ function rasterFude() {
     return cur;
   };
   let out = dilate(fid, steps);
-  if (P.close && steps) {   // 外側から同じ幅だけ削る(外周は元に戻り、筆の間の隙間は埋まったまま)
+  if (close && steps) {   // 外側から同じ幅だけ削る(外周は元に戻り、筆の間の隙間は埋まったまま)
     const outside = new Int32Array(N); for (let i = 0; i < N; i++) outside[i] = out[i] >= 0 ? -1 : 0;
     const grown = dilate(outside, steps);
     for (let i = 0; i < N; i++) if (grown[i] >= 0 && fid[i] < 0) out[i] = -1;
@@ -432,7 +463,7 @@ async function computeFeatures() {
   A.cst = st; A.csw = Math.ceil(w / st); A.csh = Math.ceil(h / st); A.cs = new Uint32Array(A.csw * A.csh);
   // 標高の色の範囲(粗く読んで1〜99%)
   setStatus('DEMを読み込み中…'); await tick();
-  const pre = await readArea(0, 0, w, h);
+  const pre = A.z = await readArea(0, 0, w, h);   // 田面トレースでも使うので残す
   let zlo = 0, zhi = 1;
   { const s = []; const src = pre; for (let i = 0; i < src.length; i += 53) if (src[i] === src[i]) s.push(src[i]);
     s.sort((a, b) => a - b); if (s.length) { zlo = s[Math.floor(s.length * 0.01)]; zhi = s[Math.floor(s.length * 0.99)] + 0.01; } }
@@ -471,6 +502,274 @@ async function computeFeatures() {
     }
     done++; setStatus(`地形を計算中…${Math.round(done / (nwx * nwy) * 100)}%`); progress(done / (nwx * nwy)); await tick();
   }
+}
+
+// ===================== 田面トレース(筆ポリゴンなしで、DEMの平らな面から田面を拾う) =====================
+let TR = null;   // { regs: [{ id, cells, area, polyArea, z, sd, bbox, edge, fude, fudeOv }], features, match }
+// つながったかたまりに番号を振る(0=対象外)。size:セル数、edge:計算範囲の端に接するか
+function labelComp(test, w, h, conn8) {
+  const N = w * h, lab = new Int32Array(N), st = new Int32Array(N), size = [0], edge = [0];
+  let n = 0;
+  for (let s = 0; s < N; s++) {
+    if (lab[s] || !test(s)) continue;
+    n++; let top = 0, cnt = 0, e = 0; st[top++] = s; lab[s] = n;
+    while (top) {
+      const i = st[--top]; cnt++;
+      const r = (i / w) | 0, c = i - r * w;
+      if (r === 0 || c === 0 || r === h - 1 || c === w - 1) e = 1;
+      for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+        if ((!dr && !dc) || (!conn8 && dr && dc)) continue;
+        const rr = r + dr, cc = c + dc; if (rr < 0 || cc < 0 || rr >= h || cc >= w) continue;
+        const j = rr * w + cc; if (!lab[j] && test(j)) { lab[j] = n; st[top++] = j; }
+      }
+    }
+    size.push(cnt); edge.push(e);
+  }
+  return { lab, n, size, edge };
+}
+// 内側のセルについて、外側(と計算範囲の端)までの距離(セル、2パスの近似ユークリッド距離)
+function chamfer(inside, w, h) {
+  const N = w * h, D = new Float32Array(N), s2 = Math.SQRT2;
+  for (let r = 0; r < h; r++) for (let c = 0; c < w; c++) { const i = r * w + c; D[i] = inside(i) && r > 0 && c > 0 && r < h - 1 && c < w - 1 ? 1e9 : 0; }
+  for (let r = 1; r < h; r++) for (let c = 1; c < w - 1; c++) { const i = r * w + c; let d = D[i]; if (!d) continue;
+    d = Math.min(d, D[i - 1] + 1, D[i - w] + 1, D[i - w - 1] + s2, D[i - w + 1] + s2); D[i] = d; }
+  for (let r = h - 2; r >= 0; r--) for (let c = w - 2; c >= 1; c--) { const i = r * w + c; let d = D[i]; if (!d) continue;
+    d = Math.min(d, D[i + 1] + 1, D[i + w] + 1, D[i + w + 1] + s2, D[i + w - 1] + s2); D[i] = d; }
+  return D;
+}
+async function traceFields() {
+  const { w, h, N, slp, rel, z } = A, cellA = A.dx * A.dy, res = (A.dx + A.dy) / 2;
+  setStatus('平坦部を探しています…'); await tick();
+  // 1. 平坦部:傾斜が小さく、畦の高まりでもない所
+  const sT = P.tSlope * 2, rT = P.tRelief, flat = new Uint8Array(N);
+  for (let i = 0; i < N; i++) flat[i] = slp[i] !== 255 && slp[i] < sT && rel[i] < rT ? 1 : 0;
+  { const sp = labelComp(i => !flat[i] && slp[i] !== 255, w, h, true), lim = 4 / cellA;   // 平坦部の中の4 m²未満の点(DEMのノイズ)は平坦に
+    for (let i = 0; i < N; i++) { const l = sp.lab[i]; if (l && sp.size[l] < lim && !sp.edge[l]) flat[i] = 1; } }
+  // 2. 芯:畦から tCore 以上離れた平坦部。細いすき間ではつながらないので、田面ごとに分かれる
+  setStatus('田面の芯を探しています…'); await tick();
+  const D = chamfer(i => flat[i] === 1, w, h), coreT = P.tCore / res;
+  const core = labelComp(i => flat[i] === 1 && D[i] >= coreT, w, h, true), lab = core.lab, nC = core.n;
+  const mz = new Float64Array(nC + 1);
+  for (let i = 0; i < N; i++) { const l = lab[i]; if (l) mz[l] += z[i]; }
+  for (let l = 1; l <= nC; l++) mz[l] /= core.size[l];
+  // 3. 芯から、標高の近い平坦部へ同時に広げる(隣の田面とは真ん中で分かれる)
+  setStatus('田面を広げています…'); await tick();
+  const q = new Int32Array(N), tol = P.tDz / 100; let qh = 0, qt = 0;
+  for (let i = 0; i < N; i++) if (lab[i]) q[qt++] = i;
+  const grow = (j, l) => { if (!lab[j] && flat[j] && Math.abs(z[j] - mz[l]) <= tol) { lab[j] = l; q[qt++] = j; } };
+  while (qh < qt) { const i = q[qh++], l = lab[i], c = i % w;
+    if (c > 0) grow(i - 1, l); if (c < w - 1) grow(i + 1, l); if (i >= w) grow(i - w, l); if (i < N - w) grow(i + w, l); }
+  // 3b. 田面の縁を1セル戻す:縁のセルは隣の段差のせいで傾斜が大きく出るが、標高は田面と同じ(±5cm以内、畦の高まりでない)
+  { const rimTol = Math.min(tol, 0.05), add = [];
+    const test = (j, l) => !lab[j] && slp[j] !== 255 && rel[j] < rT && Math.abs(z[j] - mz[l]) <= rimTol;
+    for (let i = 0; i < N; i++) { const l = lab[i]; if (!l) continue; const c = i % w;
+      if (c > 0 && test(i - 1, l)) add.push(i - 1, l); if (c < w - 1 && test(i + 1, l)) add.push(i + 1, l);
+      if (i >= w && test(i - w, l)) add.push(i - w, l); if (i < N - w && test(i + w, l)) add.push(i + w, l); }
+    for (let k = 0; k < add.length; k += 2) if (!lab[add[k]]) lab[add[k]] = add[k + 1]; }
+  // 4. 田面の中の小さな穴(1枚の田面だけに囲まれたもの)を埋める
+  const holes = labelComp(i => !lab[i], w, h, false), holeLim = P.tHole / cellA, hn = new Int32Array(holes.n + 1);
+  const small = hl => hl && holes.size[hl] < holeLim && !holes.edge[hl];
+  const look = (hl, j) => { const v = lab[j]; if (v > 0) hn[hl] = hn[hl] === 0 ? v : hn[hl] === v ? v : -1; };
+  for (let i = 0; i < N; i++) { const hl = holes.lab[i]; if (!small(hl)) continue; const c = i % w;
+    if (c > 0) look(hl, i - 1); if (c < w - 1) look(hl, i + 1); if (i >= w) look(hl, i - w); if (i < N - w) look(hl, i + w); }
+  for (let i = 0; i < N; i++) { const hl = holes.lab[i]; if (small(hl) && hn[hl] > 0) lab[i] = hn[hl]; }
+  // 5. 田面ごとの集計と選別(小さすぎる・水平でない・範囲の端にかかる)
+  const cnt = new Float64Array(nC + 1), s1 = new Float64Array(nC + 1), s2 = new Float64Array(nC + 1), edge = new Uint8Array(nC + 1), bb = new Int32Array((nC + 1) * 4);
+  for (let l = 0; l <= nC; l++) { bb[l * 4] = w; bb[l * 4 + 1] = h; bb[l * 4 + 2] = -1; bb[l * 4 + 3] = -1; }
+  for (let r = 0; r < h; r++) for (let c = 0; c < w; c++) { const i = r * w + c, l = lab[i]; if (!l) continue;
+    const d = z[i] - mz[l]; cnt[l]++; s1[l] += d; s2[l] += d * d;
+    if (c < bb[l * 4]) bb[l * 4] = c; if (r < bb[l * 4 + 1]) bb[l * 4 + 1] = r; if (c > bb[l * 4 + 2]) bb[l * 4 + 2] = c; if (r > bb[l * 4 + 3]) bb[l * 4 + 3] = r;
+    if (r === 0 || c === 0 || r === h - 1 || c === w - 1) edge[l] = 1; }
+  const keep = new Int32Array(nC + 1), regs = [];
+  for (let l = 1; l <= nC; l++) {
+    if (!cnt[l]) continue;
+    const m = s1[l] / cnt[l], sd = Math.sqrt(Math.max(0, s2[l] / cnt[l] - m * m)), a = cnt[l] * cellA;
+    if (a < P.tMinArea || sd * 100 > P.tMaxSd || (P.tEdgeEx && edge[l])) continue;
+    regs.push({ id: regs.length + 1, cells: cnt[l], area: a, z: mz[l] + m, sd, bbox: [bb[l * 4], bb[l * 4 + 1], bb[l * 4 + 2], bb[l * 4 + 3]], edge: !!edge[l] });
+    keep[l] = regs.length;
+  }
+  for (let i = 0; i < N; i++) lab[i] = keep[lab[i]];
+  A.lab = lab; A.flat = flat;
+  TR = { regs, match: null, features: [] };
+}
+// 筆ポリゴンとのずれを推定し、田面と筆を対応づける
+async function matchFude() {
+  if (!TR) return;
+  TR.match = null;
+  if (!FUDE.length || !TR.regs.length) return;
+  const sel = selectFude(A.ox, A.oy - A.h * A.dy, A.ox + A.w * A.dx, A.oy);
+  if (!sel.length) return;
+  setStatus('筆ポリゴンとのずれを調べています…'); await tick();
+  A.sel = sel; rasterFude(0, false);   // バッファなしで焼き込み(A.fid、A.bd=筆の境界からの距離 0.1m単位)
+  const { w, h, N, lab, fid, bd } = A, cellA = A.dx * A.dy, R = Math.max(1, Math.round(P.tShift / A.dx)), cap = 50;
+  // 田面のセル(多いときは偏りのない間引き)。筆を動かしたとき、田面が筆の境界からどれだけ内側にあるか(5mで頭打ち)の合計を最大にする
+  let nT = 0; for (let i = 0; i < N; i++) if (lab[i]) nT++;
+  const keepK = Math.max(1, Math.ceil(nT / 1.5e6)), smp0 = [];
+  for (let r = R; r < h - R; r++) for (let c = R; c < w - R; c++) { const i = r * w + c; if (lab[i] && (Math.imul(i, 2654435761) >>> 0) % keepK === 0) smp0.push(i); }
+  if (!smp0.length) return;
+  const smp = Int32Array.from(smp0), S = 2 * R + 1, score = new Float64Array(S * S);
+  for (let sy = -R; sy <= R; sy++) {
+    for (let sx = -R; sx <= R; sx++) { const o = sy * w + sx; let t = 0;
+      for (let k = 0; k < smp.length; k++) { const v = bd[smp[k] - o]; t += v < cap ? v : cap; }
+      score[(sy + R) * S + sx + R] = t; }
+    setStatus(`筆ポリゴンとのずれを調べています…${Math.round((sy + R + 1) / S * 100)}%`); progress((sy + R + 1) / S); await tick();
+  }
+  let bi = 0; for (let k = 1; k < score.length; k++) if (score[k] > score[bi]) bi = k;
+  const by = Math.floor(bi / S) - R, bx = bi % S - R, at = (x, y) => score[(y + R) * S + x + R];
+  const sub = (m, c0, p) => { const d = m - 2 * c0 + p; return d < 0 ? Math.max(-0.5, Math.min(0.5, (m - p) / (2 * d))) : 0; };   // 放物線で1セル未満まで
+  const fx = Math.abs(bx) < R ? sub(at(bx - 1, by), at(bx, by), at(bx + 1, by)) : 0, fy = Math.abs(by) < R ? sub(at(bx, by - 1), at(bx, by), at(bx, by + 1)) : 0;
+  const dE = (bx + fx) * A.dx, dN = -(by + fy) * A.dy;   // 筆を動かす量(東・北、m)
+  const inside = o => { let n = 0; for (let k = 0; k < smp.length; k++) if (fid[smp[k] - o] >= 0) n++; return n / smp.length; };
+  // 動かした筆と田面の重なり
+  const o = by * w + bx, nF = sel.length, fT = new Float64Array(nF), ov = new Map();
+  for (let i = 0; i < N; i++) { const l = lab[i]; if (!l) continue; const c = i % w - bx, j = i - o;
+    if (c < 0 || c >= w || j < 0 || j >= N) continue; const f = fid[j]; if (f < 0) continue;
+    fT[f]++; const key = l * nF + f; ov.set(key, (ov.get(key) || 0) + 1); }
+  const best = new Float64Array(TR.regs.length + 1), bestF = new Int32Array(TR.regs.length + 1).fill(-1);
+  ov.forEach((n, key) => { const l = Math.floor(key / nF), f = key - l * nF; if (n > best[l]) { best[l] = n; bestF[l] = f; } });
+  const nReg = new Int32Array(nF);
+  TR.regs.forEach(Rg => { const f = bestF[Rg.id]; Rg.fude = f >= 0 ? fudeId(sel[f].f, sel[f].i) : null; Rg.fudeOv = f >= 0 ? best[Rg.id] / Rg.cells : 0; if (f >= 0) nReg[f]++; });
+  const geo = sel.map((s, k) => ({ type: 'Feature', properties: { ...s.f.properties, 筆面積_m2: r1(s.area), 田面_m2: r1(fT[k] * cellA), 田面数: nReg[k], ずれ_東_m: +dE.toFixed(2), ずれ_北_m: +dN.toFixed(2) },
+    geometry: { type: 'MultiPolygon', coordinates: s.xy.map(poly => poly.map(ring => ring.map(([x, y]) => { const [lng, lat] = DEMI.tr.inverse([x + dE, y + dN]); return [+lng.toFixed(8), +lat.toFixed(8)]; }))) } }));
+  TR.match = { dE, dN, atLimit: Math.abs(bx) === R || Math.abs(by) === R, in0: inside(0), inB: inside(o),
+    fude: sel.map((s, k) => ({ s, id: fudeId(s.f, s.i), polyArea: s.area, tanmen: fT[k] * cellA, nReg: nReg[k] })), geo };
+}
+// ダグラス・ポイカー(閉じた輪、最後の点=最初の点)
+function simplifyRing(pts, tol) {
+  const n = pts.length - 1; if (n < 4 || tol <= 0) return pts;
+  let far = 1, dm0 = -1; for (let i = 1; i < n; i++) { const d = (pts[i][0] - pts[0][0]) ** 2 + (pts[i][1] - pts[0][1]) ** 2; if (d > dm0) { dm0 = d; far = i; } }
+  const keep = new Uint8Array(n + 1); keep[0] = keep[far] = keep[n] = 1;
+  const stack = [[0, far], [far, n]], t2 = tol * tol;
+  while (stack.length) {
+    const [a, b] = stack.pop(), [ax, ay] = pts[a], vx = pts[b][0] - ax, vy = pts[b][1] - ay, L2 = vx * vx + vy * vy;
+    let im = -1, dm = t2;
+    for (let i = a + 1; i < b; i++) { const px = pts[i][0] - ax, py = pts[i][1] - ay;
+      let d; if (!L2) d = px * px + py * py; else { const t = (px * vx + py * vy) / L2, cx = px - t * vx, cy = py - t * vy; d = cx * cx + cy * cy; }
+      if (d > dm) { dm = d; im = i; } }
+    if (im >= 0) { keep[im] = 1; stack.push([a, im], [im, b]); }
+  }
+  const out = pts.filter((_, i) => keep[i]);
+  return out.length >= 4 ? out : pts;
+}
+const ringArea = pts => { let s = 0; for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) s += (pts[j][0] + pts[i][0]) * (pts[j][1] - pts[i][1]); return Math.abs(s) / 2; };
+const tanmenProps = Rg => { const p = { 番号: Rg.id, 面積_m2: r1(Rg.polyArea ?? Rg.area), セル面積_m2: r1(Rg.area), 標高_m: +Rg.z.toFixed(2), 標高SD_cm: r1(Rg.sd * 100), 範囲の端: Rg.edge };
+  if (TR.match) { p.筆ID = Rg.fude ?? null; p.筆との重なり_pct = r1((Rg.fudeOv || 0) * 100); } return p; };
+// 田面をポリゴンにする(d3-contour → 単純化 → 緯度経度)
+function buildTraceFeatures() {
+  const { w, lab } = A, tol = P.tSimp / ((A.dx + A.dy) / 2), feats = [];
+  TR.regs.forEach(Rg => {
+    const [c0, r0, c1, rr1] = Rg.bbox, bw = c1 - c0 + 3, bh = rr1 - r0 + 3, v = new Float64Array(bw * bh);
+    for (let r = r0; r <= rr1; r++) for (let c = c0; c <= c1; c++) if (lab[r * w + c] === Rg.id) v[(r - r0 + 1) * bw + (c - c0 + 1)] = 1;
+    const [mp] = d3.contours().size([bw, bh]).thresholds([0.5])(v);
+    let area = 0; const coords = [];
+    mp.coordinates.forEach(poly => {
+      const rings = poly.map(rg => simplifyRing(rg, tol)).filter(rg => rg.length >= 4);
+      if (!rings.length) return;
+      rings.forEach((rg, k) => area += (k ? -1 : 1) * ringArea(rg) * A.dx * A.dy);
+      coords.push(rings.map(rg => rg.map(([u, t]) => { const [lng, lat] = DEMI.tr.inverse([A.ox + (u - 1 + c0) * A.dx, A.oy - (t - 1 + r0) * A.dy]); return [+lng.toFixed(8), +lat.toFixed(8)]; })));
+    });
+    Rg.polyArea = area;
+    feats.push({ type: 'Feature', geometry: { type: 'MultiPolygon', coordinates: coords }, properties: tanmenProps(Rg) });
+  });
+  TR.features = feats;
+}
+const traceGeo = L.geoJSON(null, {
+  style: f => ({ color: '#ffffff', weight: 1.5, opacity: 0.95, fillColor: `hsl(${(f.properties.番号 * 137.508) % 360},75%,55%)`, fillOpacity: 0.35 }),
+  onEachFeature: (f, l) => l.on('click', e => { L.DomEvent.stopPropagation(e); showTanmen(f, e.latlng); }),
+});
+const shiftLayer = L.geoJSON(null, { style: () => ({ color: '#00e5ff', weight: 1.5, dashArray: '4 3', fill: false }), interactive: false });
+function drawTrace() {
+  traceGeo.clearLayers(); shiftLayer.clearLayers();
+  if (!TR) return;
+  traceGeo.addData({ type: 'FeatureCollection', features: TR.features });
+  if (P.showTrace) traceGeo.addTo(map);
+  if (TR.match) { shiftLayer.addData({ type: 'FeatureCollection', features: TR.match.geo }); shiftLayer.addTo(map); }
+}
+function showTanmen(f, ll) {
+  const rows = Object.entries(f.properties).map(([k, v]) => `<tr><td class="muted">${esc(k)}</td><td class="r">${esc(v)}</td></tr>`).join('');
+  L.popup({ maxWidth: 300 }).setLatLng(ll).setContent(`<b>田面 ${esc(f.properties.番号)}</b><table class="sum" style="margin-top:4px">${rows}</table>`).openOn(map);
+}
+const median = a => { if (!a.length) return 0; const b = [...a].sort((x, y) => x - y); return b[Math.floor(b.length / 2)]; };
+const traceCond = () => `傾斜 ${P.tSlope}°未満 / 畦 ${P.tRelief}cm(幅 ${A.reliefWin}m 未満) / 芯 ${P.tCore}m / 標高差 ${P.tDz}cm / 最小 ${P.tMinArea}m² / 標高SD ${P.tMaxSd}cm以下 / 単純化 ${P.tSimp}m${P.tEdgeEx ? ' / 範囲の端を除く' : ''}`;
+function traceStatus() {
+  if (!TR) return;
+  const ha = TR.regs.reduce((a, r) => a + (r.polyArea ?? r.area), 0) / 1e4, M = TR.match;
+  setStatus(`田面 ${nf(TR.regs.length)} 枚・${nf(ha, 2)} ha` + (M ? ` / 筆ポリゴンとのずれ:東へ ${M.dE.toFixed(1)} m、北へ ${M.dN.toFixed(1)} m` : ''));
+}
+// from:'trace'=田面を拾い直す、'match'=筆との照合から、'poly'=ポリゴン化だけ
+async function retrace(from) {
+  if (!A || !A.z) return;
+  if (from !== 'trace' && !TR) return;
+  if (from === 'trace') await traceFields();
+  if (from !== 'poly') await matchFude();
+  buildTraceFeatures(); drawTrace(); progress(null); traceStatus(); render();
+}
+const setAreaFrame = () => areaFrame.setLatLngs([[A.ox, A.oy], [A.ox + A.w * A.dx, A.oy], [A.ox + A.w * A.dx, A.oy - A.h * A.dy], [A.ox, A.oy - A.h * A.dy]].map(c => DEMI.tr.inverse(c)).map(([x, y]) => [y, x]));
+async function runTrace() {
+  try {
+    document.getElementById('runBtn').disabled = true;
+    setStatus('範囲を準備中…'); progress(0); await tick();
+    const g = planDem();
+    FUDE.forEach(f => delete f._res);
+    A = g; RES = null; TR = null; drawTrace(); clsLayer.redraw();
+    setAreaFrame();
+    await computeFeatures();
+    await retrace('trace');
+  } catch (e) { console.error(e); alert(e.message); setStatus(''); }
+  finally { progress(null); const b = document.getElementById('runBtn'); if (b) b.disabled = false; render(); }
+}
+function exportTanmenGeo() {
+  save(`田面ポリゴン_${today()}.geojson`, JSON.stringify({ type: 'FeatureCollection', 条件: traceCond(), features: TR.features }), 'application/geo+json');
+}
+const csvq = v => { const s = String(v ?? ''); return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+function exportTanmenCsv() {
+  const M = TR.match, head = ['番号', '面積_m2', 'セル面積_m2', '標高_m', '標高SD_cm', '範囲の端'].concat(M ? ['筆ID', '筆との重なり_%'] : []);
+  const rows = TR.regs.map(Rg => [Rg.id, r1(Rg.polyArea ?? Rg.area), r1(Rg.area), Rg.z.toFixed(2), r1(Rg.sd * 100), Rg.edge ? 1 : 0].concat(M ? [Rg.fude ?? '', r1((Rg.fudeOv || 0) * 100)] : []));
+  save(`田面一覧_${today()}.csv`, '\ufeff' + [`# ${traceCond()}`, head.join(','), ...rows.map(r => r.map(csvq).join(','))].join('\r\n'), 'text/csv');
+}
+function exportFudeTanmenCsv() {
+  const M = TR.match, head = [P.idField || '番号'].concat(P.filterField ? [P.filterField] : [], ['筆面積_m2', '田面面積_m2', '田面率_%', '田面の数']);
+  const rows = M.fude.map(f => [f.id].concat(P.filterField ? [f.s.f.properties[P.filterField]] : [], [r1(f.polyArea), r1(f.tanmen), f.polyArea ? r1(f.tanmen / f.polyArea * 100) : 0, f.nReg]));
+  save(`筆ごとの田面面積_${today()}.csv`, '\ufeff' + [`# ${traceCond()} / 筆のずれ補正 東 ${M.dE.toFixed(2)}m 北 ${M.dN.toFixed(2)}m`, head.join(','), ...rows.map(r => r.map(csvq).join(','))].join('\r\n'), 'text/csv');
+}
+function exportShiftedFude() {
+  const M = TR.match;
+  save(`筆ポリゴン_ずれ補正_${today()}.geojson`, JSON.stringify({ type: 'FeatureCollection', 補正: { 東_m: +M.dE.toFixed(2), 北_m: +M.dN.toFixed(2) }, features: M.geo }), 'application/geo+json');
+}
+function traceHtml() {
+  const T = TR, M = T?.match, tot = T ? T.regs.reduce((a, r) => a + (r.polyArea ?? r.area), 0) : 0;
+  return `
+    <div class="box"><h3>2. 田面とみなす条件</h3><div class="grid2">
+      <span>傾斜</span><span><input type="number" class="n" id="tSl" value="${P.tSlope}" min="0.5" max="20" step="0.5"> 度未満を平坦とする</span>
+      <span>畦の高まり</span><span><input type="number" class="n" id="tRl" value="${P.tRelief}" min="1" max="100" step="1"> cm以上は田面の切れ目</span>
+      <span>田面の芯</span><span><input type="number" class="n" id="tCo" value="${P.tCore}" min="0.5" max="10" step="0.5"> m <span class="small muted">これより細いすき間で切り離す</span></span>
+      <span>標高の差</span><span><input type="number" class="n" id="tDz" value="${P.tDz}" min="1" max="200" step="1"> cm以内まで広げる</span>
+      <span>最小の田面</span><span><input type="number" class="n" id="tMa" value="${P.tMinArea}" min="0" max="10000" step="10"> m²</span>
+      <span>標高のばらつき</span><span><input type="number" class="n" id="tSd" value="${P.tMaxSd}" min="1" max="200" step="1"> cm以下(水平な面だけ)</span>
+      <span>輪郭の単純化</span><span><input type="number" class="n" id="tSi" value="${P.tSimp}" min="0" max="5" step="0.1"> m</span>
+      <span></span><span class="small"><label><input type="checkbox" id="tEdge" ${P.tEdgeEx ? 'checked' : ''}> 計算範囲の端にかかる田面は除く</label></span>
+      <span>筆とのずれ</span><span><input type="number" class="n" id="tSh" value="${P.tShift}" min="1" max="30" step="1"> m まで探す <span class="small muted">筆ポリゴンがあるとき</span></span>
+    </div>
+    <div class="small muted" style="margin-top:4px">平らな面を、畦から「芯」の距離だけ内側に縮めて田面ごとの種にし、標高の近い平坦部へ広げて1枚ずつ切り分けます。計算後は数値を変えるとすぐやり直します(「畦の幅の上限」は畦畔検出モードの値を使います)。</div></div>
+    <div class="box"><h3>3. 計算</h3>
+      <div class="btns"><button id="runBtn" class="main" ${TILES.length ? '' : 'disabled'}>表示範囲で田面をトレースする</button></div>
+      <div class="small muted" style="margin-top:4px">地図に見えている範囲のDEMから田面を拾います。筆ポリゴンを読み込んでいれば、ずれを推定して対応づけます。</div>
+      <div class="prog" id="prog"><span></span></div></div>
+    ${T ? `<div class="box"><h3>結果</h3>
+      <table class="sum">
+        <tr><td>田面</td><td class="r">${nf(T.regs.length)} 枚</td></tr>
+        <tr><td>田面の面積(合計)</td><td class="r">${nf(tot / 1e4, 2)} ha</td></tr>
+        <tr><td>1枚の面積(中央値)</td><td class="r">${nf(median(T.regs.map(r => r.polyArea ?? r.area)))} m²</td></tr>
+        <tr><td>標高のばらつき(中央値)</td><td class="r">${(median(T.regs.map(r => r.sd)) * 100).toFixed(1)} cm</td></tr>
+        ${M ? `<tr><td><b>筆ポリゴンのずれ</b></td><td class="r"><b>東へ ${M.dE.toFixed(1)} m・北へ ${M.dN.toFixed(1)} m</b></td></tr>
+          <tr><td>田面が筆の内側にある割合</td><td class="r">${(M.in0 * 100).toFixed(0)}% → ${(M.inB * 100).toFixed(0)}%</td></tr>
+          <tr><td>田面が見つかった筆</td><td class="r">${nf(M.fude.filter(f => f.tanmen > 0).length)} / ${nf(M.fude.length)} 筆</td></tr>` : ''}
+      </table>
+      ${M?.atLimit ? '<div class="small warn" style="margin-top:4px">ずれが探した範囲の端です。「筆とのずれ」を広げてください。</div>' : ''}
+      ${M ? '<div class="small muted" style="margin:4px 0">筆ポリゴンをこの量だけ動かすと田面とよく重なります(水色の点線)。表示範囲全体で1つの平行移動として推定しています。</div>' : ''}
+      <div class="btns" style="margin-top:6px"><button id="xTg">田面ポリゴン(GeoJSON)</button><button id="xTc">田面の一覧(CSV)</button>
+        ${M ? '<button id="xTf">筆ごとの田面面積(CSV)</button><button id="xTs">ずれを補正した筆(GeoJSON)</button>' : ''}
+        <button id="xCs">CS立体図(PNG)</button></div></div>` : ''}`;
 }
 
 // グレースケールのオープニング(最小値フィルタ→最大値フィルタ、正方形 (2r+1)×(2r+1))。段の縁や斜面はそのまま、畦のような細い高まりは削られる
@@ -549,10 +848,10 @@ async function run() {
     setStatus('範囲を準備中…'); progress(0); await tick();
     const plan = planArea();
     FUDE.forEach(f => delete f._res);
-    A = plan; RES = null;
+    A = plan; RES = null; TR = null; drawTrace();
     setStatus(`筆ポリゴンを焼き込み中…(${nf(A.sel.length)} 筆・${nf(A.w)}×${nf(A.h)} セル)`); await tick();
     rasterFude();
-    areaFrame.setLatLngs([[A.ox, A.oy], [A.ox + A.w * A.dx, A.oy], [A.ox + A.w * A.dx, A.oy - A.h * A.dy], [A.ox, A.oy - A.h * A.dy]].map(c => DEMI.tr.inverse(c)).map(([x, y]) => [y, x]));
+    setAreaFrame();
     await computeFeatures();
     classify();
     const t = RES.reduce((a, r) => (a[0] += r.aze, a[1] += r.block, a), [0, 0]);
@@ -594,16 +893,17 @@ const clsLayer = new (gridLayer((gx, gy) => A.cls ? CLS_COL[A.cls[gy * A.w + gx]
 if (P.showCs) csLayer.addTo(map);
 if (P.showCls) clsLayer.addTo(map);
 const areaFrame = L.polygon([], { color: '#00e5ff', weight: 2, dashArray: '8 6', fill: false, interactive: false }).addTo(map);
-const layerCtl = L.control.layers(bases, { 'CS立体図': csLayer, '畦畔・田面': clsLayer, '筆ポリゴン': fudeLayer, 'DEMの範囲': demFrames }).addTo(map);
+const layerCtl = L.control.layers(bases, { 'CS立体図': csLayer, '畦畔・田面': clsLayer, '筆ポリゴン': fudeLayer, '田面ポリゴン': traceGeo, 'ずれを補正した筆': shiftLayer, 'DEMの範囲': demFrames }).addTo(map);
 map.on('overlayadd overlayremove', e => {
   const on = e.type === 'overlayadd';
-  if (e.layer === csLayer) P.showCs = on; else if (e.layer === clsLayer) P.showCls = on; else if (e.layer === fudeLayer) P.showFude = on; else return;
+  if (e.layer === csLayer) P.showCs = on; else if (e.layer === clsLayer) P.showCls = on; else if (e.layer === fudeLayer) P.showFude = on; else if (e.layer === traceGeo) P.showTrace = on; else return;
   saveP(); render();
 });
 const legend = L.control({ position: 'bottomright' });
 legend.onAdd = () => { const d = L.DomUtil.create('div', 'legend');
   d.innerHTML = `<i style="background:rgba(229,40,30,.85)"></i>畦畔(法面・畦)<br><i style="background:rgba(255,241,118,.5)"></i>田面<br>
     <i style="background:rgba(120,120,120,.5)"></i>DEMなし<br><i style="background:transparent;border:2px solid #ffee58"></i>筆ポリゴン<br>
+    <i style="background:rgba(80,200,120,.4);border:2px solid #fff"></i>田面ポリゴン<br><i style="background:transparent;border:2px dashed #00e5ff"></i>ずれを補正した筆<br>
     <i style="background:transparent;border:2px dashed #00e5ff"></i>計算範囲`; return d; };
 legend.addTo(map);
 function showFude(f, ll) {
@@ -684,6 +984,9 @@ function render() {
   const opt = (v, cur) => `<option value="${esc(v)}" ${v === cur ? 'selected' : ''}>${esc(v || '(なし)')}</option>`;
   const nSel = FUDE.filter(fudeSelected).length;
   $('panel').innerHTML = `
+    <div class="box"><h3>モード</h3>
+      <div class="btns"><button id="mAze" class="${P.mode !== 'trace' ? 'main' : ''}">畦畔検出(筆ポリゴンを使う)</button><button id="mTr" class="${P.mode === 'trace' ? 'main' : ''}">田面トレース(DEMだけ)</button></div>
+      <div class="small muted" style="margin-top:4px">${P.mode === 'trace' ? 'DEMの平らな面から田面を1枚ずつ拾い、ポリゴンにします。筆ポリゴンは無くても動きます(読み込むと、ずれの推定と筆ごとの田面面積を出します)。' : '筆ポリゴンをバッファ・ディゾルブした農地ブロックの中で、畦畔を検出します。'}</div></div>
     <div class="box"><h3>1. データを読み込む</h3>
       <div class="btns"><button id="bDem">DEM(.tif、複数可)</button><button id="bFude">筆ポリゴン(.geojson/.gpkg)</button></div>
       <div class="small muted" style="margin-top:4px">ファイルは地図にドラッグ&ドロップでも読み込めます。データはこのPCの中だけで処理され、どこにも送信されません。</div>
@@ -697,6 +1000,7 @@ function render() {
           <span></span><span class="small muted">${P.filterField ? `${nf(nSel)} 筆が対象${P.filterField === 'land_type' ? '(農水省の筆ポリゴン:100=田、200=畑)' : ''}` : 'すべての筆が対象'}</span>
         </div>` : ''}
     </div>
+    ${P.mode === 'trace' ? traceHtml() : `
     <div class="box"><h3>2. 農地ブロック(計算する範囲)</h3><div class="grid2">
       <span>バッファ</span><span><input type="number" class="n" id="pBuf" value="${P.buffer}" min="0" max="20" step="0.1"> m
         <span class="small muted">筆どうしの隙間を埋めてディゾルブ</span></span>
@@ -730,10 +1034,12 @@ function render() {
       <div class="small muted" style="margin:4px 0">筆をクリックすると筆ごとの値。「斜面に沿った面積」は草刈りなどの実作業面積の目安です。</div>
       <div class="btns"><button id="xCsv">筆ごとの集計(CSV)</button><button id="xFude">筆ポリゴン+集計(GeoJSON)</button>
         <button id="xAze">畦畔ポリゴン(GeoJSON)</button><button id="xTif">分類ラスタ(GeoTIFF)</button><button id="xCs">CS立体図(PNG)</button></div></div>` : ''}
+    `}
     <div class="box"><h3>表示</h3><div class="grid2">
       <span><label><input type="checkbox" id="vCs" ${P.showCs ? 'checked' : ''}> CS立体図</label></span><span><input type="range" id="oCs" min="0" max="1" step="0.05" value="${P.csOpacity}"></span>
       <span><label><input type="checkbox" id="vCls" ${P.showCls ? 'checked' : ''}> 畦畔・田面</label></span><span><input type="range" id="oCls" min="0" max="1" step="0.05" value="${P.clsOpacity}"></span>
       <span><label><input type="checkbox" id="vFude" ${P.showFude ? 'checked' : ''}> 筆ポリゴン</label></span><span></span>
+      <span><label><input type="checkbox" id="vTr" ${P.showTrace ? 'checked' : ''}> 田面ポリゴン</label></span><span></span>
     </div></div>
     <div class="small muted">DEMは地表面の高さです。法面の草丈や樹木、水路・農道の段差も地形として拾うので、結果は航空写真と見比べて確かめてください。</div>`;
   const on = (id, ev, f) => { const e = $(id); if (e) e[ev] = f; };
@@ -749,11 +1055,18 @@ function render() {
   num('pMa', 'minAza', () => A && classify()); num('pMf', 'minFlat', () => A && classify());
   num('pEd', 'edgeDist', () => A && classify()); num('pSm', 'smooth', () => A && classify());
   num('pRw', 'reliefWin', () => { if (A && confirm('畦の幅の上限を変えたので、表示範囲で計算し直しますか?')) run(); });
-  on('runBtn', 'onclick', run);
+  on('runBtn', 'onclick', P.mode === 'trace' ? runTrace : run);
+  on('mAze', 'onclick', () => { P.mode = 'aze'; saveP(); render(); });
+  on('mTr', 'onclick', () => { P.mode = 'trace'; saveP(); render(); });
+  const tnum = (id, key, from) => on(id, 'onchange', e => { const v = parseFloat(e.target.value); if (!Number.isFinite(v)) return; P[key] = v; saveP(); retrace(from); });
+  tnum('tSl', 'tSlope', 'trace'); tnum('tRl', 'tRelief', 'trace'); tnum('tCo', 'tCore', 'trace'); tnum('tDz', 'tDz', 'trace');
+  tnum('tMa', 'tMinArea', 'trace'); tnum('tSd', 'tMaxSd', 'trace'); tnum('tSi', 'tSimp', 'poly'); tnum('tSh', 'tShift', 'match');
+  on('tEdge', 'onchange', e => { P.tEdgeEx = e.target.checked; saveP(); retrace('trace'); });
+  on('xTg', 'onclick', exportTanmenGeo); on('xTc', 'onclick', exportTanmenCsv); on('xTf', 'onclick', exportFudeTanmenCsv); on('xTs', 'onclick', exportShiftedFude);
   on('xCsv', 'onclick', exportCsv); on('xFude', 'onclick', exportFudeGeojson); on('xAze', 'onclick', exportAzeGeojson);
   on('xTif', 'onclick', exportClsTif); on('xCs', 'onclick', exportCsPng);
   const vis = (id, layer, key) => on(id, 'onchange', e => { P[key] = e.target.checked; saveP(); P[key] ? layer.addTo(map) : layer.remove(); });
-  vis('vCs', csLayer, 'showCs'); vis('vCls', clsLayer, 'showCls'); vis('vFude', fudeLayer, 'showFude');
+  vis('vCs', csLayer, 'showCs'); vis('vCls', clsLayer, 'showCls'); vis('vFude', fudeLayer, 'showFude'); vis('vTr', traceGeo, 'showTrace');
   on('oCs', 'oninput', e => { P.csOpacity = +e.target.value; csLayer.setOpacity(P.csOpacity); }); on('oCs', 'onchange', saveP);
   on('oCls', 'oninput', e => { P.clsOpacity = +e.target.value; clsLayer.setOpacity(P.clsOpacity); }); on('oCls', 'onchange', saveP);
 }
